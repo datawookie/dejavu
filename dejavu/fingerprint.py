@@ -1,11 +1,12 @@
+from hashlib import sha1
+from struct import pack
+
 import numpy as np
 import matplotlib.mlab as mlab
 import matplotlib.pyplot as plt
 from scipy.ndimage.filters import maximum_filter
 from scipy.ndimage.morphology import (generate_binary_structure,
                                       iterate_structure, binary_erosion)
-import hashlib
-from operator import itemgetter
 
 IDX_FREQ_I = 0
 IDX_TIME_J = 1
@@ -94,40 +95,31 @@ def get_2D_peaks(arr2D, plot=False, amp_min=DEFAULT_AMP_MIN):
     struct = generate_binary_structure(2, 1)
     neighborhood = iterate_structure(struct, PEAK_NEIGHBORHOOD_SIZE)
 
-    # find local maxima using our fliter shape
+    # find local maxima using our filter shape
     local_max = maximum_filter(arr2D, footprint=neighborhood) == arr2D
     background = (arr2D == 0)
     eroded_background = binary_erosion(background, structure=neighborhood,
                                        border_value=1)
 
     # Boolean mask of arr2D with True at peaks
-    detected_peaks = local_max - eroded_background
+    detected_peaks = local_max ^ eroded_background
 
-    # extract peaks
-    amps = arr2D[detected_peaks]
-    j, i = np.where(detected_peaks)
-
-    # filter peaks
-    amps = amps.flatten()
-    peaks = zip(i, j, amps)
-    peaks_filtered = [x for x in peaks if x[2] > amp_min]  # freq, time, amp
-
-    # get indices for frequency and time
-    frequency_idx = [x[1] for x in peaks_filtered]
-    time_idx = [x[0] for x in peaks_filtered]
+    # extract and filter peaks into array of [frequency, time] indices
+    peaks = np.transpose(detected_peaks.nonzero())
+    peaks = peaks[arr2D[detected_peaks] > amp_min]
 
     if plot:
         # scatter of the peaks
         fig, ax = plt.subplots()
         ax.imshow(arr2D)
-        ax.scatter(time_idx, frequency_idx)
+        ax.scatter(peaks[:, IDX_TIME_J], peaks[:, IDX_FREQ_I])
         ax.set_xlabel('Time')
         ax.set_ylabel('Frequency')
         ax.set_title("Spectrogram")
         plt.gca().invert_yaxis()
         plt.show()
 
-    return zip(frequency_idx, time_idx)
+    return peaks
 
 
 def generate_hashes(peaks, fan_value=DEFAULT_FAN_VALUE):
@@ -137,20 +129,21 @@ def generate_hashes(peaks, fan_value=DEFAULT_FAN_VALUE):
     [(e05b341a9b77a51fd26, 32), ... ]
     """
     if PEAK_SORT:
-        peaks = sorted(peaks, key=itemgetter(1))
+        # use mergesort to match sorted()
+        time = peaks[:, IDX_TIME_J]
+        peaks = peaks[time.argsort(kind='mergesort')]
+
+    freq = peaks[:, IDX_FREQ_I]
+    time = peaks[:, IDX_TIME_J]
 
     for i in range(len(peaks)):
-        for j in range(1, fan_value):
-            if (i + j) < len(peaks):
-                
-                freq1 = peaks[i][IDX_FREQ_I]
-                freq2 = peaks[i + j][IDX_FREQ_I]
-                t1 = peaks[i][IDX_TIME_J]
-                t2 = peaks[i + j][IDX_TIME_J]
-                t_delta = t2 - t1
+        freq1 = freq[i]
+        freq2 = freq[i + 1:i + fan_value]
+        t1 = time[i]
+        dt = time[i + 1:i + fan_value] - t1
+        j = (dt >= MIN_HASH_TIME_DELTA) & (dt <= MAX_HASH_TIME_DELTA)
 
-                if t_delta >= MIN_HASH_TIME_DELTA and t_delta <= MAX_HASH_TIME_DELTA:
-                    h = hashlib.sha1(
-                        ("%s|%s|%s" % (str(freq1), str(freq2), str(t_delta))).encode('utf-8')
-                    )
-                    yield (h.hexdigest()[0:FINGERPRINT_REDUCTION], t1)
+        for freq2, dt in zip(freq2[j], dt[j]):
+            # I: unsigned int, should be enough for indices
+            h = sha1(pack('III', freq1, freq2, dt))
+            yield h.hexdigest()[:FINGERPRINT_REDUCTION], t1
